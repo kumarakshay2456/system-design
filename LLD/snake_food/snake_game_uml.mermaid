@@ -1,0 +1,68 @@
+classDiagram
+    class Direction {
+        <<enumeration>>
+        UP
+        DOWN
+        LEFT
+        RIGHT
+    }
+    
+    class Position {
+        +int x
+        +int y
+        +__eq__(other) bool
+    }
+    
+    class SnakeNode {
+        +Position position
+        +SnakeNode next
+        +__init__(position)
+    }
+    
+    class Snake {
+        +SnakeNode head
+        +SnakeNode tail
+        +Direction direction
+        +int length
+        +__init__(start_position)
+        +change_direction(new_direction)
+        +move(grow)
+        -_get_next_position() Position
+        +get_all_positions() list
+        +is_position_on_snake(position) bool
+    }
+    
+    class Food {
+        +Position position
+        +__init__(position)
+    }
+    
+    class GameBoard {
+        +int width
+        +int height
+        +Snake snake
+        +Food food
+        +int score
+        +bool game_over
+        +__init__(width, height)
+        -_generate_food() Food
+        +update()
+    }
+    
+    class GameEngine {
+        +GameBoard board
+        +float frame_delay
+        +__init__(width, height)
+        +process_input(key)
+        +update()
+        +is_game_over() bool
+        +get_score() int
+    }
+    
+    Direction --o Snake : uses
+    Position --* SnakeNode : has
+    SnakeNode --* Snake : has
+    Position --* Food : has
+    Snake --* GameBoard : has
+    Food --* GameBoard : has
+    GameBoard --* GameEngine : has
