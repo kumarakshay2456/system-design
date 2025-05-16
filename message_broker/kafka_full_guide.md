@@ -208,5 +208,5 @@ services:
 - Real-time event streaming
 - Stream processing at scale
 - Event sourcing and audit logs
-- Decoupled communication between microservices
+- Decoupled communication between micro-services
 

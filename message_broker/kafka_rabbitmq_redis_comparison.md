@@ -7,20 +7,20 @@ This guide compares **Kafka**, **RabbitMQ**, and **Redis** for message brokering
 
 ## 📊 Summary Table
 
-| Feature / Tool        | **Kafka** 🦄                     | **RabbitMQ** 🐇                    | **Redis Streams** 🟥               |
-|-----------------------|----------------------------------|-----------------------------------|-----------------------------------|
-| Type                  | Distributed Log / Stream         | Message Broker / Queue            | In-Memory Data Structure / Stream |
-| Protocol              | Kafka Protocol / TCP             | AMQP / MQTT / STOMP               | Custom Redis Protocol (RESP)      |
-| Message Retention     | Time-based, size-based (default: 7 days) | Until acknowledged (manual/auto) | Configurable (based on memory)    |
-| Message Ordering      | Per partition                    | Per queue                         | Per stream                        |
-| Replayability         | ✅ Yes (seek to offset)          | ❌ No (unless requeue manually)   | ✅ Yes (via stream ID)            |
-| Persistence           | ✅ Durable                       | ✅ Durable                        | ✅ Durable (with AOF/RDB)         |
-| Scale Horizontally    | ✅ Native Partitioning            | ⚠️ Requires Sharding Plugins     | ⚠️ Via Redis Cluster              |
-| Performance           | High throughput (100K+ msg/s)    | Moderate (1K–10K msg/s)           | Very fast (low-latency in-memory) |
-| Use Cases             | Real-time stream processing, analytics, ETL | Background tasks, RPC, pub/sub | Lightweight queuing, fast caching |
-| Complexity            | High (Zookeeper/KRaft setup)     | Medium                            | Low                               |
-| Delayed Messaging     | ✅ With Kafka Streams / 3rd party | ✅ Native TTL plugin              | ✅ Via sorted sets or streams     |
-| Language Support      | Wide (Java, Python, Go, etc.)    | Wide                              | Wide                              |
+| Feature / Tool     | **Kafka** 🦄                                | **RabbitMQ** 🐇                  | **Redis Streams** 🟥              |
+| ------------------ | ------------------------------------------- | -------------------------------- | --------------------------------- |
+| Type               | Distributed Log / Stream                    | Message Broker / Queue           | In-Memory Data Structure / Stream |
+| Protocol           | Kafka Protocol / TCP                        | AMQP / MQTT / STOMP              | Custom Redis Protocol (RESP)      |
+| Message Retention  | Time-based, size-based (default: 7 days)    | Until acknowledged (manual/auto) | Configurable (based on memory)    |
+| Message Ordering   | Per partition                               | Per queue                        | Per stream                        |
+| Replayability      | ✅ Yes (seek to offset)                      | ❌ No (unless requeue manually)   | ✅ Yes (via stream ID)             |
+| Persistence        | ✅ Durable                                   | ✅ Durable                        | ✅ Durable (with AOF/RDB)          |
+| Scale Horizontally | ✅ Native Partitioning                       | ⚠️ Requires Sharding Plugins     | ⚠️ Via Redis Cluster              |
+| Performance        | High throughput (100K+ msg/s)               | Moderate (1K–10K msg/s)          | Very fast (low-latency in-memory) |
+| Use Cases          | Real-time stream processing, analytics, ETL | Background tasks, RPC, pub/sub   | Lightweight queuing, fast caching |
+| Complexity         | High (Zookeeper/KRaft setup)                | Medium                           | Low                               |
+| Delayed Messaging  | ✅ With Kafka Streams / 3rd party            | ✅ Native TTL plugin              | ✅ Via sorted sets or streams      |
+| Language Support   | Wide (Java, Python, Go, etc.)               | Wide                             | Wide                              |
 
 ---
 
@@ -79,10 +79,4 @@ Redis Streams offer **low-latency** and **lightweight** operations.
 
 ---
 
-## 🧳 Conclusion
-
-- 🦄 **Kafka** → Best for real-time streaming, durability, scalability, and large data pipelines.
-- 🐇 **RabbitMQ** → Ideal for background job queues, pub/sub, retry workflows, and routing.
-- 🟥 **Redis** → Perfect for lightweight, fast, ephemeral queues or cache-like messaging.
-
-Use the right tool for the right job. Each has strengths depending on latency, scale, and persistence requirements.
+[[messaging_comparison]]
