@@ -90,6 +90,8 @@ A more interesting production issue was encoding: Excel files from certain HR to
 
 **Resume line**: *"Built high-throughput OTP notification system using SQS and RabbitMQ with failure handling mechanisms."*
 
+> **Note**: All answers in this section are based on the actual `notification-hub` Go codebase. Use these exact details when answering — they make your answers concrete and credible.
+
 ---
 
 ### Interview Question 1
@@ -97,58 +99,344 @@ A more interesting production issue was encoding: Excel files from certain HR to
 **Interviewer**: "Walk me through how you designed this system. What were the requirements and what choices did you make?"
 
 **Your Answer**:
-The requirements were: deliver OTPs via SMS reliably, with low latency (user is waiting), handle vendor outages gracefully, and not lose messages if something crashes mid-processing.
+The system is a centralized notification gateway built in Go. It handles multiple message types — OTP, transactional, and marketing — across four channels: SMS, email, push, and WhatsApp.
 
-The system is a Go-based notification gateway. Clients publish a `NotificationTask` (protobuf) to an SQS queue. A Go consumer picks up messages, inserts a task record into PostgreSQL, then passes it to what we call a Priority Engine which handles actual delivery.
+The entry points are command-line flags in `main.go`. You run separate processes per consumer type:
+```
+run_sqsconsumer             → reads from SQS Task queue
+run_otpconsumer             → reads from SQS OTP queue (separate queue)
+run_marketingconsumer       → reads from SQS Marketing queue
+run_rabbitconsumer          → reads from RabbitMQ delayed queues (retries)
+run_deliveryreportconsumer  → reads SQS Delivery Report queue
+run_grpc                    → gRPC server on port 9000
+run_httpserver              → REST server
+```
 
-For OTP specifically: there's a dedicated OTP consumer that validates the OTP expiry timestamp before even attempting delivery. If the OTP has already expired by the time we dequeue it (could happen during traffic spikes), we move it to a dead-letter queue rather than sending a stale OTP. That's a security requirement as much as a functional one.
+Each consumer is independently deployed and scaled. This means a flood of marketing messages cannot delay OTP delivery — they're on completely separate SQS queues and separate consumer pods.
 
-For failure handling: if the SMS vendor (Gupshup) fails, the message goes to a RabbitMQ delayed queue with a backoff window. RabbitMQ handles the retry scheduling — we use the delayed message plugin to fire retries at 30 seconds, 5 minutes, 30 minutes. After max retries, the task is marked failed and an alert fires.
+The message contract is a protobuf `NotificationTask` with three `MessageType` values: `MARKETING=0`, `TRANSACTIONAL=1`, `OTP=2`. Each task carries channel-specific sub-messages — `SMS`, `Email`, `Whatsapp`, `Push` — and each sub-message has its own expiry timestamp as a Unix epoch.
+
+For failure handling, we use SQS as the primary ingest queue (managed, durable) and RabbitMQ for retry scheduling. SQS doesn't support variable-delay retries beyond 15 minutes, but RabbitMQ with the delayed message plugin does — and we need different retry windows for different failure types (generic failures vs. Firebase throttling vs. marketing time window expiry).
 
 **Cross-Questions**:
 
-1. "Why SQS *and* RabbitMQ? Why not just SQS with a Dead Letter Queue for retries?"
-   > *Probe*: This is the core architecture question. SQS DLQ is for messages that failed permanently — it's not a retry queue with configurable delay. SQS has a max message delay of 15 minutes. If you need retry at 30 minutes or 2 hours (for transient vendor outages), you need something else. RabbitMQ with the delayed message plugin gives you per-message TTL and sophisticated routing — different failure types route to different queues with different retry windows. Firebase throttling has a different retry strategy than a generic network error.
+1. "Why SQS *and* RabbitMQ? Why not SQS with a DLQ for retries?"
+   > SQS DLQ is for messages that have permanently failed — it doesn't support configurable retry delays. Our three RabbitMQ queues are: `NotificationDelayedCommonQueue` (5-minute delay, generic failures), `NotificationDelayedFirebaseQueue` (Firebase-specific throttle handling), `NotificationDelayedMarketingQueue` (marketing messages that missed their sending window). These routing decisions can't be expressed with SQS DLQ — it's a single destination with no routing logic.
 
-2. "You said you validate OTP expiry before sending. What's the TTL on an OTP in your system?"
-   > *Probe*: Typically 5–10 minutes. The TTL is part of the proto message itself (Unix timestamp). The consumer compares current time against the expiry field. This is interesting because the expiry is set by the producer (Staffing API) at publish time, not by the notification hub. If the message sits in SQS for 10 minutes because of a traffic spike, it's expired by the time the consumer sees it. That's the correct behavior — you don't want users receiving an "expired" OTP and being confused.
+2. "You have separate SQS queues per message type — OTP queue, task queue, marketing queue. What's the operational overhead and how do you justify it?"
+   > The overhead is real: more SQS queues, more consumer deployments, more Kubernetes pods. The justification: isolation. OTP is a user-blocking operation (login, verification). If a marketing campaign floods the task queue, OTP must not be delayed. Separate queues give independent scaling and backpressure. The OTP consumer also has different logic — expiry validation and `InitiateOtpEngine` instead of `InitiatePriorityEngine` — which would be messy to combine.
 
-3. "What happens if Gupshup delivers the SMS successfully but your acknowledgment back to the queue fails? Could you send the OTP twice?"
-   > *Probe*: Yes, this is the dual-write problem. The sequence is: receive SQS message → insert into DB → call Gupshup → update DB → delete SQS message. If the process crashes between "Gupshup called" and "SQS deleted", the message is redelivered and Gupshup gets called again. The defense: idempotency key sent to Gupshup (if they support it). If not, the OTP is sent twice — which is annoying but not catastrophic since OTPs are single-use.
+3. "The proto has a `triggeredOn` timestamp (Unix epoch). Is this the time the message was produced or the time it should be delivered?"
+   > It's the time the task was triggered/produced. It's used for tracking and logging, not for scheduled delivery. Scheduled delivery would require an additional `scheduled_at` field and a delay mechanism at ingest. The current system is near-real-time only.
 
-4. "You mentioned this is high-throughput. What does high-throughput mean in your case — what's the peak load?"
-   > *Probe*: Be specific with numbers — even rough ones. "We see X OTPs/minute during peak login hours, Y during batch operations." Then reason about whether SQS → Go consumers → Gupshup can sustain that rate. The bottleneck is usually the SMS vendor (rate limits per second), not your own infrastructure.
+4. "You said OTP and transactional are separate queues but you use `InitiateOtpEngine` vs `InitiatePriorityEngine`. What's the actual difference between the two?"
+   > `InitiateOtpEngine` overrides the message type to `utils.Otp` regardless of what the proto says, and checks expiry once more inside the engine before each channel send. `InitiatePriorityEngine` uses whatever `MessageType` is in the proto. The OTP engine also uses the OTP-specific SQS queue for message deletion (`OtpQSettings`), not the Task queue.
 
 5. "How do you monitor OTP delivery success rate? What do you alert on?"
-   > *Probe*: New Relic custom events per delivery channel. Alert on: delivery success rate below 95%, OTP consumer queue depth above threshold (means consumers can't keep up), consecutive Gupshup failures (circuit breaker logic). Also: end-to-end latency alert — OTP should deliver within 10 seconds of being published.
+   > New Relic APM tracks a transaction per consumer call. We track per-channel status updates in PostgreSQL: `status=Done(3)`, `status=Failed(1)`, `status=Expired(4)`. An alert on OTP `status=Failed` rate above threshold would fire. Queue depth is a leading indicator: if `OtpQ` depth grows faster than the consumer processes, we need to scale OTP consumer pods.
 
 ---
 
 ### Interview Question 2
 
-**Interviewer**: "You said 'failure handling mechanisms.' Beyond retries, what else did you implement?"
+**Interviewer**: "Walk me through what happens step by step from a message arriving in SQS to the SMS being delivered."
 
 **Your Answer**:
-Several layers:
+Here's the exact flow in `sqsConsumer/consumer.go`:
 
-**Rate limiting at the consumer level**: If downstream vendors start throttling us, the consumer detects this and backs off — stops consuming new messages for a period rather than hammering a degraded vendor. This prevents thundering herd when a vendor recovers.
+**Step 1 — Goroutine pool setup**:
+```go
+jobs := make(chan *sqs.Message)
+for w := 1; w <= settings.GetSettings().Generic.SqsWorkerPool; w++ {
+    go sc.worker(w, jobs)
+}
+```
+The worker count comes from config (`SqsWorkerPool`). Each worker is a goroutine that reads from the `jobs` channel.
 
-**Separate consumers per message type**: OTP consumer, marketing consumer, and transactional consumer are separate processes. A flood of marketing messages won't delay OTP delivery — they have independent queue depths and scaling.
+**Step 2 — Consumer loop with rate limiter check**:
+```go
+// Before receiving, check ConsumerRateLimiter status
+if !sqsConsumerStatus.GetStatus() {
+    // Rate limited: check endTime, sleep if needed
+    // Call sqsConsumerStatus.ResetChannel() when endTime expires
+}
+sqsOutput, _ := TaskQ.ReceiveMessage()
+// Push messages to jobs channel
+sqsConsumerStatus.UpdateProcessedMessages()
+```
 
-**Delivery reports**: Vendors like SendGrid and Firebase send webhooks when a message is actually delivered (or bounced, or opened). A separate delivery report consumer ingests these and updates the status in our database. This gives accurate delivery tracking rather than just "we attempted to send."
+**Step 3 — Message parsing in `processMessages()`**:
+```go
+var pbTask pb.NotificationTask
 
-**Waterfall delivery**: For transactional notifications (not OTP), if email fails we fall back to SMS, then to push. Each channel has a configurable offset so we give the first channel time to succeed before trying the next. OTPs skip the waterfall — we go straight to SMS.
+// Attempt 1: proto.UnmarshalText — Python SDK sends text-format proto
+err := proto.UnmarshalText(*message.Body, &pbTask)
+
+// Attempt 2: base64 decode + proto.Unmarshal — JS SDK sends binary
+if err != nil {
+    decoded, _ := base64.StdEncoding.DecodeString(*message.Body)
+    err = proto.Unmarshal(decoded, &pbTask)
+}
+
+// Both failed → delete from SQS + send to DLQ
+if err != nil {
+    TaskQ.DeleteMessage(receiptHandle)
+    utils.DeadLetterQSQSProducer.SendMessage(*message.Body)
+    return
+}
+```
+
+**Step 4 — Add defaults**:
+```go
+utils.AddDefaults(&pbTask)  // Sets default expiry if not provided
+```
+
+**Step 5 — DB insert**:
+```go
+var baseModel models.BaseModel
+dbErr := models.InsertIntoDB(&pbTask, &baseModel)
+// Creates records in: task table, sms table (if SMS != nil),
+// email table (if Email != nil), push table (if Push != nil)
+```
+If DB fails with `CommonDBConnectionError`, the message is routed to RabbitMQ with `DelayedCommonRoutingKey` — the SQS message is NOT deleted, so it will reappear.
+
+**Step 6 — Priority Engine**:
+```go
+priorityengine.InitiatePriorityEngine(log, &pbTask, receiptHandle, 0)
+```
+
+Inside the Priority Engine, for the SMS channel:
+```go
+vendorID, smsCount, vendor, err := SendSMS(log, pbTask, messageType)
+// SendSMS internally:
+// 1. utils.IsExpired(sms.Expiry) → returns ExpiredError if past
+// 2. utils.IsProfaneWordPresent(log, sms.GetContext())
+// 3. template.GetTemplatedContext(log, context, templateURL, utils.SMS)
+// 4. smsServices.GenericPayload{...}.Send(log)
+//    → Gupshup API call, returns messageID
+
+// Update DB:
+models.UpdateDBStatusAndVendorID(models.UpdateFields{
+    TableName: models.SMSTable,
+    TaskID:    pbTask.GetID(),
+    Status:    utils.Done,     // or utils.Failed, utils.Expired
+    VendorID:  vendorID,       // Gupshup message ID
+    Vendor:    utils.Gupshup,  // "GS"
+})
+```
+
+**Step 7 — SQS deletion**:
+```go
+// Only after priority engine completes
+if messageType == utils.Marketing {
+    marketingQ.DeleteMessage(receiptHandle)
+} else {
+    taskQ.DeleteMessage(receiptHandle)  // TRANSACTIONAL
+}
+```
 
 **Cross-Questions**:
 
-1. "Consumer-level rate limiting — how does your consumer know that the vendor is throttling vs. just a transient error?"
-   > *Probe*: HTTP 429 from the vendor is the signal. Or a series of consecutive 5xx responses. The rate limiter tracks this and sets a cool-down window. The challenge: you're blocking the consumer thread during cool-down, so messages pile up in SQS. That's fine — SQS is the buffer. The interviewer might ask: what if cool-down is 10 minutes and SQS message visibility timeout is 30 seconds? You'd be re-delivering the same messages to other consumers who are also rate-limited.
+1. "You delete from SQS after the Priority Engine completes — meaning after the vendor call. If the vendor call takes 5 seconds and SQS visibility timeout is 30 seconds, you have headroom. But if it takes 35 seconds, the message reappears and another consumer picks it up. How do you handle this?"
+   > This is a real risk. The defense: set visibility timeout > max expected processing time. Our vendor calls (Gupshup, SendGrid) should complete in under 3 seconds under normal conditions. If a vendor is slow, we extend the visibility timeout programmatically during processing. The deeper fix: DB insert has a `UNIQUE` constraint on task ID — if a second consumer picks up the duplicate and tries to insert, it gets an IntegrityError which is treated as "already processed."
 
-2. "Waterfall with time offsets — if Email fails instantly and SMS is the fallback, do you still wait the full offset time before trying SMS?"
-   > *Probe*: Design flaw worth acknowledging. If email fails fast (connection refused, not a timeout), you shouldn't wait the full 5-minute offset. The offset is meant to give email a chance to succeed, not to delay SMS when email is clearly broken. Better design: start the offset timer when you *send* email, not when email *fails*.
+2. "You said `template.GetTemplatedContext()` is called before every send. What does this do and where does the template live?"
+   > Templates are stored at URLs in cloud storage (likely S3 or GCS) — the `template` field in the proto is a URL string. `GetTemplatedContext` fetches the template HTML/text, then renders it using Go's `text/template` package with the `context` JSON string as the data source. This means every send involves an HTTP fetch for the template. Optimization: in-memory LRU cache keyed by template URL — same template fetched once per consumer process lifetime.
 
-3. "You have separate consumers for different message types. How do you handle priority within a message type? All transactional messages are equal — but some are urgent."
-   > *Probe*: Honest answer: in the current design, within a type it's FIFO (SQS ordering). True priority queuing at the message level would require SQS FIFO queues with message group IDs, or Kafka with priority topic partitions. Acknowledging this limitation shows maturity.
+3. "You do a profanity check on SMS and WhatsApp content. How does `IsProfaneWordPresent` work and what happens if it triggers?"
+   > It checks the rendered template context against a blocklist of words. If triggered, `SendSMS` returns `ProfaneWordCheckFailedError`. The Priority Engine calls `errorHandler(err)` which maps this to `status = utils.Failed` with `statusDetail = "ProfaneWordCheckFailed"`. The message is marked failed in the DB — it's not retried via RabbitMQ because profanity is not a transient error.
+
+---
+
+### Interview Question 3
+
+**Interviewer**: "Tell me about the OTP consumer specifically — how is it different from the regular SQS consumer?"
+
+**Your Answer**:
+The OTP consumer (`otpConsumer/consumer.go`) has three key differences from the regular SQS consumer:
+
+**1. No rate limiter**. The regular SQS consumer has a `ConsumerRateLimiter` that can pause the consumer if message throughput exceeds a threshold. The OTP consumer has no such limiter — OTPs are always processed as fast as possible. We don't want to accidentally throttle OTP delivery.
+
+**2. Expiry validation at consumer level** (before DB insert):
+```go
+// In otpConsumer/processMessages():
+if pbTask.GetSms() != nil {
+    isSmsExpired = utils.IsExpired(sms.GetExpiry())
+}
+if pbTask.GetEmail() != nil {
+    isEmailExpired = utils.IsExpired(email.GetExpiry())
+}
+
+// If BOTH channels expired AND message type is OTP:
+// → Send to OTP DLQ (otpDLQSettings)
+// → Return error (don't process further)
+```
+
+We also add a default expiry if none is set in the proto:
+```go
+func addExpiry(pbTask *pb.NotificationTask) {
+    defaultSmsExpiryInMin := settings.GetSettings().Generic.OtpExpiry
+    if sms != nil && sms.GetExpiry() == 0 {
+        sms.Expiry = utils.CalculateTimeFromNowEpoch(defaultSmsExpiryInMin)
+    }
+    defaultEmailExpiryInMin := settings.GetSettings().Generic.OtpEmailExpiry
+    if email != nil && email.GetExpiry() == 0 {
+        email.Expiry = utils.CalculateTimeFromNowEpoch(defaultEmailExpiryInMin)
+    }
+}
+```
+
+**3. Calls `InitiateOtpEngine` instead of `InitiatePriorityEngine`**. The OTP engine forces `messageType = utils.Otp` and deletes from the OTP-specific queue (`OtpQSettings`), not the Task queue.
+
+**Cross-Questions**:
+
+1. "The expiry check happens at the consumer level AND again inside `SendSMS` in the Priority Engine. Why check twice?"
+   > Defense in depth. The consumer-level check is coarse: if both SMS and email are expired, skip entirely. But between the consumer check and the actual `SendSMS` call, time passes (DB insert, goroutine scheduling). The per-channel check inside `SendSMS` catches messages that expired in that small window. Also: each channel has its own expiry. SMS might expire in 5 minutes but email in 30 — the channel-level check handles this correctly.
+
+2. "An OTP that expires at the consumer level goes to the OTP DLQ. What's in the DLQ and who monitors it?"
+   > The OTP DLQ holds expired OTPs that were never delivered. These should be monitored for two signals: (1) consistent DLQ growth means consumers are too slow — SQS depth growing faster than processing, need more OTP consumer pods; (2) individual expired OTPs in the DLQ are expected during traffic spikes — they indicate users who won't receive their OTP and will need to request a new one. Alert: DLQ depth > X should page the team.
+
+3. "The regular SQS consumer has a configurable worker pool size (`SqsWorkerPool`). The OTP consumer has a separate `OtpWorkerPool`. In production, how do you set these values and how do you know if they're correct?"
+   > Set based on throughput requirements and vendor rate limits. If Gupshup allows 100 SMS/second and each Send call takes ~200ms, you need at least 20 concurrent workers to saturate Gupshup's capacity (20 × 200ms = 4 seconds to process 20 messages, but goroutines are concurrent so it's ~20 messages/200ms = 100/second). Monitor: if OTP queue depth grows, increase `OtpWorkerPool`. If Gupshup starts returning 429s, decrease it.
+
+---
+
+### Interview Question 4
+
+**Interviewer**: "Walk me through the RabbitMQ retry mechanism — what triggers it and how does it work?"
+
+**Your Answer**:
+The retry trigger happens inside `InitiatePriorityEngine`. After each channel send attempt, the error is checked:
+
+```go
+if status == utils.Failed {
+    if err == utils.FirebaseThrottlingError {
+        // Firebase specifically: different retry queue, retry counter NOT incremented
+        rabbitmqProcessingNeeded = true
+        rabbitmqRoutingKey = utils.DelayedFirebaseRoutingKey
+        firebaseMessage = true
+    } else if err == utils.MarketingTimePassedError {
+        // Marketing outside sending hours
+        rabbitmqProcessingNeeded = true
+        rabbitmqRoutingKey = utils.DelayedMarketingRoutingKey
+    } else {
+        // Generic failure: DB errors, vendor errors, timeouts
+        rabbitmqProcessingNeeded = rabbitmqlib.IsRabbitmqProcessingNeeded(...)
+        rabbitmqRoutingKey = utils.DelayedCommonRoutingKey
+    }
+}
+```
+
+Then the message is written to RabbitMQ:
+```go
+rabbitmqlib.ProducerChannel.WriteMessageToDelayedQueue(log, &rabbitmqlib.Message{
+    Data:            pbTask.String(),   // protobuf text representation
+    RetryCounter:    retryCounter,      // 0 for Firebase (not incremented), +1 for others
+    FirebaseRequest: firebaseMessage,   // flag for Firebase throttle path
+}, rabbitmqRoutingKey)
+```
+
+In `rabbitmqConsumer/consumer.go`, the retry message is processed:
+
+```go
+// 1. MAX RETRY CHECK:
+if retryCounter > settings.GetSettings().Generic.RabbitmqMaxRetry {
+    utils.DeadLetterQSQSProducer.SendMessage(messageBody)
+    TaskDLQProducer.SendMessage(messageBody)
+    return errors.New("RabbitMQ max retry exhausted")
+}
+
+// 2. FIREBASE THROTTLE CHECK:
+if firebaseRequest {
+    status := utils.GetFirebaseRateLimiterStatus()
+    if !status {
+        endTime := utils.GetFirebaseRateLimiterEndTime()
+        if !utils.IsExpired(endTime) {
+            // Firebase still throttled → re-queue to Firebase delayed queue
+            rabbitmqlib.ProducerChannel.WriteMessageToDelayedQueue(log, &Message{
+                Data: messageBody, RetryCounter: retryCounter, FirebaseRequest: true,
+            }, utils.DelayedFirebaseRoutingKey)
+            return nil
+        }
+        // Firebase throttle expired → reset and proceed
+        utils.UpdateFirebaseRateLimiter(true)
+    }
+}
+
+// 3. Re-insert to DB (if not already there), then call Priority Engine
+priorityengine.InitiatePriorityEngine(log, &pbTask, "", retryCounter)
+// Note: receiptHandle is "" because there's no SQS message to delete
+```
+
+**Cross-Questions**:
+
+1. "Firebase retry counter is not incremented — `firebaseMessage = true` prevents the counter bump. Couldn't a message loop in the Firebase delayed queue forever if Firebase never recovers?"
+   > Yes — this is a real risk. A Firebase throttle without recovery means the message bounces between `DelayedFirebaseRoutingKey` and the RabbitMQ consumer indefinitely, since the retry counter doesn't increment. The protection: `utils.IsExpired(endTime)` eventually returns true (the throttle window expires), and `UpdateFirebaseRateLimiter(true)` resets the status. If Firebase is genuinely down for hours, the task's own expiry field will cause `SendPush` to return `ExpiredError` — which maps to `status=Expired` and stops retrying.
+
+2. "The Firebase rate limiter uses a Go channel as a state machine (`InitFirebaseRateLimitChannel`, `GetFirebaseRateLimiterStatus`). Why a channel instead of a mutex?"
+   > The `ConsumerRateLimiter` pattern in this codebase uses a Go channel holding a single `ConsumerStatus` struct. The goroutine reads from the channel, modifies the struct, and sends it back — effectively making the channel a single-item concurrent state machine with no mutex needed. It's idiomatic Go: share memory by communicating, don't communicate by sharing memory. The trade-off: every state read/write requires a channel send/receive (allocations), which is slightly slower than a mutex read under low contention but easier to reason about.
+
+3. "After max retries, you send to both `DeadLetterQSQSProducer` (generic DLQ) and `TaskDLQProducer`. Why two DLQs?"
+   > `DeadLetterQSQSProducer` is a shared DLQ used by all consumers for generic dead letters (parsing failures, SQS consumer failures). `TaskDLQProducer` is specific to task processing failures. Separating them makes it easier to triage: generic DLQ has malformed messages, task DLQ has messages that were valid but couldn't be delivered after max retries. Different alert thresholds and different response actions.
+
+4. "RabbitMQ consumer uses `auto-ack: true` (`autoAck = true` in `channel.Consume`). If the RabbitMQ consumer goroutine crashes after receiving but before processing, is the message lost?"
+   > Yes — with `auto-ack: true`, the broker considers the message delivered the moment it's handed to the consumer. If the goroutine crashes before calling the Priority Engine, the message is gone. This is a conscious trade-off: the alternative (`auto-ack: false` with explicit `ack()` after processing) adds complexity. Since these are already retry messages from failed deliveries, the acceptable risk is: a crash in the retry consumer means the retry is lost, not the original message (which has long been deleted from SQS). For higher durability, switch to manual ack.
+
+---
+
+### Interview Question 5
+
+**Interviewer**: "Tell me about your database design for this system. How do you store notification state?"
+
+**Your Answer**:
+The database uses PostgreSQL with five core tables — `task`, `sms`, `email`, `push`, `whatsapp` — plus `vendor_event` for delivery callbacks and `email_score` for engagement scoring.
+
+All tables are hash-partitioned into 20 buckets on the primary key (`id`):
+```sql
+-- In migrations: creates task_00, task_01, ... task_19
+PARTITION BY HASH(id) WITH 20 partitions
+```
+
+`GlobalHashBucketSize = 20` is defined in `models/constants.go`. The partition key `PartitionID = "id"` is a UUID.
+
+The data model is normalized around `task_id` as the linking key:
+```
+task (id=UUID, name, message_type, sent_by_id, client, triggered_on, platform)
+  ↓ task_id FK
+sms  (id, task_id, template, send_to, status, vendor_id, vendor="GS", sms_count, expiry)
+email (id, task_id, template, subject, send_to[jsonb], status, vendor_id, expiry)
+push  (id, task_id, template, token, platform, status, vendor_id, expiry)
+whatsapp (id, task_id, template, send_to, status, vendor_id, vendor="GS", expiry)
+```
+
+Status values (from `utils.NotificationStatus`):
+```go
+Queued      = 0  // Initial state after DB insert
+Failed      = 1  // Vendor call failed
+InWaterfall = 2  // (unused currently — reserved)
+Done        = 3  // Successfully sent
+Expired     = 4  // Past expiry timestamp
+Rejected    = 5  // Profanity check failed, opt-out, etc.
+```
+
+Vendor codes stored in the DB:
+```
+"SG" = SendGrid (email)
+"GS" = Gupshup (SMS, WhatsApp)
+"FB" = Firebase (push)
+"SL" = Slack (debug/test only)
+```
+
+**Cross-Questions**:
+
+1. "Hash partitioning on UUID primary key into 20 buckets. A query like `SELECT * FROM sms WHERE task_id = X` — `task_id` is not the partition key. Does this hit all 20 partitions?"
+   > Yes — a query on a non-partition-key column must scan all 20 partitions. PostgreSQL's constraint exclusion can only prune partitions if the WHERE clause is on the partition key. For the `task_id` lookup pattern (which is the most common query: "give me all sms records for this task"), we have a separate index: `sms_task_id_idx ON sms(task_id)`. This index spans all partitions but PostgreSQL will use it for the `task_id` filter even without partition pruning. The partitioning helps with write distribution and storage management, not with this specific query pattern.
+
+2. "You store `send_to` in email as `postgres.Jsonb` (JSON) rather than a separate recipients table. Why?"
+   > Email can have multiple recipients (to, cc, bcc) with name + email fields per recipient. A JSON field avoids a separate `email_recipients` join table and allows flexible recipient structures (different fields for different vendors). The trade-off: you can't query "find all emails sent to X address" efficiently — you'd need a JSON path index or a separate denormalized column. For the notification hub's access patterns (write-heavy, read by task_id), the JSON approach is justified.
+
+3. "After a message is marked `Done` or `Failed`, do the records stay in the DB forever? What's your data retention strategy?"
+   > Currently no automated cleanup. Tables grow indefinitely. At high volume (say 1M notifications/day), the `sms` table grows by 1M rows/day across 20 partitions. With 20 partitions and PostgreSQL's `DETACH PARTITION` feature, you could implement partition-based archival: add a `created_at` range partition on top of the hash partition, detach and archive old month-partitions to cold storage. This is a known improvement area — the current system relies on periodic manual cleanup scripts.
 
 ---
 
