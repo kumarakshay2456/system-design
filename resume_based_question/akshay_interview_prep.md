@@ -122,6 +122,10 @@ For failure handling, we use SQS as the primary ingest queue (managed, durable) 
 
 1. "Why SQS *and* RabbitMQ? Why not SQS with a DLQ for retries?"
    > SQS DLQ is for messages that have permanently failed — it doesn't support configurable retry delays. Our three RabbitMQ queues are: `NotificationDelayedCommonQueue` (5-minute delay, generic failures), `NotificationDelayedFirebaseQueue` (Firebase-specific throttle handling), `NotificationDelayedMarketingQueue` (marketing messages that missed their sending window). These routing decisions can't be expressed with SQS DLQ — it's a single destination with no routing logic.
+1.1 " Why not only RabbitMQ?"
+Interviewers often ask this.
+Answer:
+RabbitMQ can do both queuing and retries, but we preferred SQS as the primary queue because it is fully managed, highly durable, and scales automatically. RabbitMQ is used only for the feature SQS lacks: flexible long-duration delayed retries. This gives us the reliability of SQS and the scheduling flexibility of RabbitMQ.
 
 2. "You have separate SQS queues per message type — OTP queue, task queue, marketing queue. What's the operational overhead and how do you justify it?"
    > The overhead is real: more SQS queues, more consumer deployments, more Kubernetes pods. The justification: isolation. OTP is a user-blocking operation (login, verification). If a marketing campaign floods the task queue, OTP must not be delayed. Separate queues give independent scaling and backpressure. The OTP consumer also has different logic — expiry validation and `InitiateOtpEngine` instead of `InitiatePriorityEngine` — which would be messy to combine.
